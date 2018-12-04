@@ -22,6 +22,7 @@ import org.scalatest._
 import scala.concurrent.duration._
 import scala.concurrent.Future
 import scala.util.Success
+import scala.util.Failure
 
 class PartitionedSourcesSpec
     extends SpecBase(kafkaPort = KafkaPorts.PartitionedSourcesSpec)
@@ -37,6 +38,127 @@ class PartitionedSourcesSpec
                         Map(
                           "offsets.topic.replication.factor" -> "1"
                         ))
+
+  "committable partitioned source" must {
+
+    "handle exceptions in stream without commit failures" in assertAllStagesStopped {
+      val partitions = 4
+      val totalMessages = 100L
+
+      val topic = createTopic(1, partitions)
+      val allTps = (0 until partitions).map(p => new TopicPartition(topic, p))
+      val group = createGroupId(1)
+      val sourceSettings = consumerDefaults
+        .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+        .withGroupId(group)
+
+      var createdSubSources = List.empty[TopicPartition]
+
+      var commitFailures = List.empty[(TopicPartition, Throwable)]
+
+      val control = Consumer
+        .committablePartitionedSource(sourceSettings, Subscriptions.topics(topic))
+        .groupBy(partitions, _._1)
+        .mapAsync(8) {
+          case (tp, source) =>
+            log.info(s"Sub-source for $tp started")
+            createdSubSources = tp :: createdSubSources
+            source
+              .mapAsync(4) { m =>
+                // fail on first partition; otherwise delay slightly and emit
+                if (tp.partition() == 0) {
+                  Future.failed(new RuntimeException("FAIL"))
+                } else {
+                  akka.pattern.after(50.millis, system.scheduler)(Future.successful(m))
+                }
+              }
+              .mapAsync(1)(_.committableOffset.commitScaladsl().andThen {
+                case Failure(e) => commitFailures ::= tp -> e
+              })
+              .scan(0L)((c, _) => c + 1)
+              .runWith(Sink.last)
+              .map { res =>
+                log.info(s"Sub-source for $tp completed: Received [$res] messages in total.")
+                res
+              }
+        }
+        .mergeSubstreams
+        .scan(0L)((c, n) => c + n)
+        .toMat(Sink.last)(Keep.both)
+        .mapMaterializedValue(DrainingControl.apply)
+        .run()
+
+      // waits until all partitions are assigned to the single consumer
+      waitUntilConsumerSummary(group, timeout = 5.seconds) {
+        case singleConsumer :: Nil => singleConsumer.assignment.size == partitions
+      }
+
+      val producer = Source(1L to totalMessages)
+        .map(n => new ProducerRecord(topic, (n % partitions).toInt, DefaultKey, n.toString))
+        .runWith(Producer.plainSink(producerDefaults, testProducer))
+
+      producer.futureValue shouldBe Done
+      sleep(5.seconds)
+      val exception = control.drainAndShutdown().failed.futureValue
+      createdSubSources should contain allElementsOf allTps
+      exception.getMessage shouldBe "FAIL"
+
+      // commits will fail if we shut down the consumer too early
+      commitFailures shouldBe empty
+    }
+
+    "get a source per partition" in assertAllStagesStopped {
+      val partitions = 4
+      val totalMessages = 100L
+
+      val topic = createTopic(1, partitions)
+      val allTps = (0 until partitions).map(p => new TopicPartition(topic, p))
+      val group = createGroupId(1)
+      val sourceSettings = consumerDefaults
+        .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+        .withGroupId(group)
+
+      var createdSubSources = List.empty[TopicPartition]
+
+      val control = Consumer
+        .committablePartitionedSource(sourceSettings, Subscriptions.topics(topic))
+        .groupBy(partitions, _._1)
+        .mapAsync(8) {
+          case (tp, source) =>
+            log.info(s"Sub-source for $tp started")
+            createdSubSources = tp :: createdSubSources
+            source
+              .mapAsync(1)(_.committableOffset.commitScaladsl())
+              .scan(0L)((c, _) => c + 1)
+              .runWith(Sink.last)
+              .map { res =>
+                log.info(s"Sub-source for $tp completed: Received [$res] messages in total.")
+                res
+              }
+        }
+        .mergeSubstreams
+        .scan(0L)((c, n) => c + n)
+        .toMat(Sink.last)(Keep.both)
+        .mapMaterializedValue(DrainingControl.apply)
+        .run()
+
+      // waits until all partitions are assigned to the single consumer
+      waitUntilConsumerSummary(group, timeout = 5.seconds) {
+        case singleConsumer :: Nil => singleConsumer.assignment.size == partitions
+      }
+
+      val producer = Source(1L to totalMessages)
+        .map(n => new ProducerRecord(topic, (n % partitions).toInt, DefaultKey, n.toString))
+        .runWith(Producer.plainSink(producerDefaults, testProducer))
+
+      producer.futureValue shouldBe Done
+      sleep(5.seconds)
+      val streamMessages = control.drainAndShutdown().futureValue
+      createdSubSources should contain allElementsOf allTps
+      streamMessages shouldBe totalMessages
+    }
+
+  }
 
   "Partitioned source" must {
 
